@@ -209,6 +209,7 @@ class TabBackend:
     Requires `pip install -e .[web]`.
     """
     name = "tab"
+    label = "tab"
 
     def __init__(self, profile_root: Path, browser: str = "edge"):
         if browser not in BROWSER_EXECUTABLES:
@@ -228,6 +229,13 @@ class TabBackend:
     def _find_open_page(self, browser):
         return _chatgpt_tab(browser, create=False)
 
+    def _reattach(self, p):
+        """Attach again to the already open ChatGPT tab. The browser is not closed or relaunched."""
+        browser = self._connect(p)
+        page = self._find_open_page(browser)
+        _keep_tab_live(page)
+        return page
+
     def send(self, prompt: str, image_dir: Optional[Path] = None,
              cancel: Optional[threading.Event] = None,
              status: Optional[Callable[[str], None]] = None,
@@ -237,10 +245,10 @@ class TabBackend:
         `partial` receives new text chunks and newly saved images while ChatGPT is still writing or rendering.
         The returned Reply then holds only what was not already passed to `partial`.
         """
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout, sync_playwright
 
         say = status or (lambda _text: None)
-        say("Starting the browser for ChatGPT...")
+        say(f"Starting the {self.label} for ChatGPT...")
         self._ensure_browser()
         with sync_playwright() as p:
             browser = self._connect(p)
@@ -249,7 +257,12 @@ class TabBackend:
             _wait_for_tab_idle(page, cancel)
             seen = _turn_keys(page)
             say("Sending the question to ChatGPT...")
-            _submit_prompt(page, prompt)
+            try:
+                _submit_prompt(page, prompt)
+            except PlaywrightTimeout:
+                say(f"The {self.label} stopped responding. Restarting the automation...")
+                page = self._reattach(p)
+                _submit_prompt(page, prompt)
             sent_at = time.monotonic()
             say("ChatGPT is replying...")
             deadline = time.monotonic() + REPLY_TIMEOUT_SECONDS
@@ -266,97 +279,128 @@ class TabBackend:
             last_progress_at = time.monotonic()
             reconnected = False
             key = None
+            pause_state = None
+            pause_at = 0.0
+            pause_text = ""
             while True:
-                _pause(POLL_SECONDS, cancel)
-                _scroll_tab_to_bottom(page)
-                _dismiss_prompts(page)
-                working = _is_generating(page)
-                prompt_found, found_key = _find_reply_key(page, prompt, seen)
-                if found_key:
-                    key = found_key
-                has_data = False
-                has_images = False
-                rendering = False
-                if key:
-                    reply = _reply_locator(page, key)
-                    turn = _reply_turn_locator(page, key)
-                    current = _reply_text(reply)
-                    rendering = _is_rendering_image(turn)
-                    if rendering and render_started is None:
-                        render_started = time.monotonic()
-                    elif not rendering:
-                        render_started = None
-                    # A reply still drawing an image has no text yet, so the image slot counts as data.
-                    has_images = turn.locator("img").count() > 0
-                    has_data = bool(current) or rendering or has_images
-                    # The reply must stay unchanged for a few polls, so an image slot that has not appeared yet is not missed.
-                    state = (current, has_images, rendering)
-                    quiet_polls = quiet_polls + 1 if state == last_state else 0
-                    if state != last_state:
-                        state_since = time.monotonic()
-                        reconnected = False
-                    last_state = state
-                    # Finished means every image has loaded and none is still rendering, and the reply has stopped changing.
-                    # A Stop control can stay on screen after ChatGPT is done, so an unchanged reply also counts as finished.
-                    render_done = not rendering or time.monotonic() - render_started >= IMAGE_WAIT_SECONDS
-                    stable = reconnected or not working or time.monotonic() - state_since >= STABLE_FINISH_SECONDS
-                    finished = (has_data and render_done and (quiet_polls >= QUIET_POLLS or reconnected) and stable
-                                and _images_loaded(turn) and (current or has_images))
-                    if partial:
-                        # The last chunk may still be growing, so it is held back until the reply is finished.
-                        chunks = split_reply(current)
-                        ready = chunks if finished else chunks[:-1]
-                        new_text = ready[emitted_chunks:]
-                        emitted_chunks = max(emitted_chunks, len(ready))
-                        new_images = (_save_tab_images(page, turn, image_dir, say, skip=image_srcs)
-                                      if image_dir and _has_big_image(turn) else [])
-                        if new_text or new_images:
-                            partial(Reply(text="\n\n".join(new_text), images=new_images))
-                    if finished:
-                        break
-                # Re-send at most once per question, and only when the question itself never landed on the page.
-                if (not prompt_found and not key and not working and not resent
-                        and time.monotonic() - sent_at >= NO_REPLY_RETRY_SECONDS):
-                    say("No reply after 15 s. Sending the question again...")
-                    _submit_prompt(page, prompt)
-                    sent_at = time.monotonic()
-                    resent = True
-                    continue
-                if rendering:
-                    now_phase = "rendering"
-                elif has_data and current:
-                    now_phase = "writing"
-                elif working:
-                    now_phase = "thinking"
-                else:
-                    now_phase = "waiting"
-                if now_phase != phase:
-                    phase = now_phase
-                    say({"rendering": "ChatGPT is rendering an image...",
-                         "writing": "ChatGPT is writing...",
-                         "thinking": "ChatGPT is thinking...",
-                         "waiting": "ChatGPT is replying..."}[phase])
-                progress = (current, has_images, rendering, phase)
-                if progress != last_progress:
-                    last_progress = progress
-                    last_progress_at = time.monotonic()
-                elif time.monotonic() - last_progress_at >= STALL_SECONDS:
-                    # Reconnect only. The prompt is never sent again, so a stall cannot cause a second question.
-                    say("ChatGPT has not changed for 10 s. Reconnecting to the tab...")
-                    # Attach again to the existing tab only. The browser is never closed and no tab is opened.
-                    try:
-                        browser = self._connect(p)
-                        page = self._find_open_page(browser)
-                    except Exception:
-                        say("Could not reconnect yet. Still watching the ChatGPT tab...")
-                        last_progress_at = time.monotonic()
+                try:
+                    _pause(POLL_SECONDS, cancel)
+                    _scroll_tab_to_bottom(page)
+                    _dismiss_prompts(page)
+                    working = _is_generating(page)
+                    prompt_found, found_key = _find_reply_key(page, prompt, seen)
+                    if found_key:
+                        key = found_key
+                    has_data = False
+                    has_images = False
+                    rendering = False
+                    if key:
+                        reply = _reply_locator(page, key)
+                        turn = _reply_turn_locator(page, key)
+                        current = _reply_text(reply)
+                        rendering = _is_rendering_image(turn)
+                        if rendering and render_started is None:
+                            render_started = time.monotonic()
+                        elif not rendering:
+                            render_started = None
+                        # A reply still drawing an image has no text yet, so the image slot counts as data.
+                        has_images = turn.locator("img").count() > 0
+                        has_data = bool(current) or rendering or has_images
+                        # ChatGPT's "Analysis paused" notice: ask it to continue once, then move on if it stays paused.
+                        paused = _analysis_paused(turn)
+                        if paused and pause_state != "resumed":
+                            if pause_state is None:
+                                say("ChatGPT paused the analysis. Sending 'please continue'...")
+                                _submit_prompt(page, PAUSE_CONTINUE_TEXT)
+                                pause_state = "sent"
+                                pause_at = time.monotonic()
+                                pause_text = current
+                            elif current != pause_text:
+                                pause_state = "resumed"
+                            elif time.monotonic() - pause_at >= PAUSE_WAIT_SECONDS:
+                                say("ChatGPT is still paused. Moving on to another question.")
+                                break
+                            if pause_state == "sent":
+                                last_progress_at = time.monotonic()
+                                continue
+                        elif not paused:
+                            pause_state = None
+                        # The reply must stay unchanged for a few polls, so an image slot that has not appeared yet is not missed.
+                        state = (current, has_images, rendering)
+                        quiet_polls = quiet_polls + 1 if state == last_state else 0
+                        if state != last_state:
+                            state_since = time.monotonic()
+                            reconnected = False
+                        last_state = state
+                        # Finished means every image has loaded and none is still rendering, and the reply has stopped changing.
+                        # A Stop control can stay on screen after ChatGPT is done, so an unchanged reply also counts as finished.
+                        render_done = not rendering or time.monotonic() - render_started >= IMAGE_WAIT_SECONDS
+                        stable = reconnected or not working or time.monotonic() - state_since >= STABLE_FINISH_SECONDS
+                        finished = (has_data and render_done and (quiet_polls >= QUIET_POLLS or reconnected) and stable
+                                    and _images_loaded(turn) and (current or has_images))
+                        if partial:
+                            # The last chunk may still be growing, so it is held back until the reply is finished.
+                            chunks = split_reply(current)
+                            ready = chunks if finished else chunks[:-1]
+                            new_text = ready[emitted_chunks:]
+                            emitted_chunks = max(emitted_chunks, len(ready))
+                            new_images = (_save_tab_images(page, turn, image_dir, say, skip=image_srcs)
+                                          if image_dir and _has_big_image(turn) else [])
+                            if new_text or new_images:
+                                partial(Reply(text="\n\n".join(new_text), images=new_images))
+                        if finished:
+                            break
+                    # Re-send at most once per question, and only when the question itself never landed on the page.
+                    if (not prompt_found and not key and not working and not resent
+                            and time.monotonic() - sent_at >= NO_REPLY_RETRY_SECONDS):
+                        say("No reply after 15 s. Sending the question again...")
+                        _submit_prompt(page, prompt)
+                        sent_at = time.monotonic()
+                        resent = True
+                        continue
+                    if rendering:
+                        now_phase = "rendering"
+                    elif has_data and current:
+                        now_phase = "writing"
+                    elif working:
+                        now_phase = "thinking"
                     else:
-                        _keep_tab_live(page)
+                        now_phase = "waiting"
+                    if now_phase != phase:
+                        phase = now_phase
+                        say({"rendering": "ChatGPT is rendering an image...",
+                             "writing": "ChatGPT is writing...",
+                             "thinking": "ChatGPT is thinking...",
+                             "waiting": "ChatGPT is replying..."}[phase])
+                    progress = (current, has_images, rendering, phase)
+                    if progress != last_progress:
+                        last_progress = progress
                         last_progress_at = time.monotonic()
-                        # The reply already on the page is complete as far as the screen shows, so it is finished now.
-                        reconnected = True
-                if time.monotonic() > deadline:
-                    raise RuntimeError("ChatGPT did not finish replying in time.")
+                    elif time.monotonic() - last_progress_at >= STALL_SECONDS:
+                        # Reconnect only. The prompt is never sent again, so a stall cannot cause a second question.
+                        say(f"ChatGPT has not changed for 10 s. Reconnecting to the {self.label}...")
+                        # Attach again to the existing page only. The prompt is never sent again.
+                        try:
+                            page = self._reattach(p)
+                        except Exception:
+                            say(f"Could not reconnect to the {self.label} yet. Still watching...")
+                            last_progress_at = time.monotonic()
+                        else:
+                            last_progress_at = time.monotonic()
+                            # The reply already on the page is complete as far as the screen shows, so it is finished now.
+                            reconnected = True
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("ChatGPT did not finish replying in time.")
+                except PlaywrightTimeout:
+                    # A locator timed out (usually after 30 s). Restart only the automation: reattach to the same page.
+                    say(f"The {self.label} stopped responding. Restarting the automation...")
+                    page = self._reattach(p)
+                    last_state = None
+                    quiet_polls = 0
+                    state_since = time.monotonic()
+                    last_progress = None
+                    last_progress_at = time.monotonic()
+                    reconnected = False
             say("ChatGPT finished. Reading the full reply...")
             _scroll_tab_to_bottom(page)
             _, final_key = _find_reply_key(page, prompt, seen)
@@ -371,6 +415,8 @@ class TabBackend:
 ASSISTANT_LABEL = "ChatGPT said:"
 TAB_COMPOSER_SELECTOR = 'div[contenteditable="true"][role="textbox"]'
 NO_REPLY_RETRY_SECONDS = 15
+PAUSE_CONTINUE_TEXT = "please continue"
+PAUSE_WAIT_SECONDS = 30
 QUIET_POLLS = 3
 POLL_SECONDS = 1
 STABLE_FINISH_SECONDS = 6
@@ -511,6 +557,14 @@ def _is_generating(page) -> bool:
         return True
 
 
+def _analysis_paused(message) -> bool:
+    """True while the reply shows ChatGPT's "Analysis paused" notice."""
+    try:
+        return bool(message.evaluate("el => /analysis paused/i.test(el.textContent)"))
+    except Exception:
+        return False
+
+
 def _images_loaded(message) -> bool:
     return message.locator("img").evaluate_all("els => els.every(e => e.complete)")
 
@@ -616,6 +670,7 @@ class AppBackend(TabBackend):
     Requires `pip install -e .[web]`.
     """
     name = "app"
+    label = "app"
 
     def __init__(self, profile_root: Path):
         self.browser = "app"
@@ -634,6 +689,11 @@ class AppBackend(TabBackend):
             if time.monotonic() > deadline:
                 raise RuntimeError("The ChatGPT app did not open its debugging port in time.")
             time.sleep(0.5)
+
+    def _reattach(self, p):
+        # The app may have been closed, so start it again before attaching to its page.
+        self._ensure_browser()
+        return super()._reattach(p)
 
     def _connect(self, p):
         return p.chromium.connect_over_cdp(APP_CDP_URL)
