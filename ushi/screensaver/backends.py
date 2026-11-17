@@ -172,10 +172,25 @@ class WebBackend:
 TAB_BROWSER_FLAGS = (
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
     "--disable-features=CalculateNativeWinOcclusion",
     "--no-first-run",
     "--disable-extensions",
 )
+
+
+BROWSER_CACHE_DIRS = ("Cache", "Code Cache", "GPUCache", "Service Worker", "ShaderCache", "GrShaderCache", "DawnCache")
+
+
+def _clear_browser_cache(profile_dir: Path) -> None:
+    """Delete cached pages, scripts, and service workers from an overlay browser profile before it starts.
+
+    Stale cached ChatGPT pages can show an old reply or hide a new one. Cookies and login data are kept,
+    so you stay signed in.
+    """
+    for folder in (profile_dir, profile_dir / "Default"):
+        for name in BROWSER_CACHE_DIRS:
+            shutil.rmtree(folder / name, ignore_errors=True)
 
 
 def _start_debug_browser(browser: str, profile_dir: Path) -> None:
@@ -190,10 +205,11 @@ def _start_debug_browser(browser: str, profile_dir: Path) -> None:
             break
     if exe is None:
         raise RuntimeError(f"{browser} was not found on this computer.")
+    _clear_browser_cache(profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
     subprocess.Popen([exe, f"--remote-debugging-port={DEBUG_PORT}", f"--user-data-dir={profile_dir}",
                       *TAB_BROWSER_FLAGS, "https://chatgpt.com"])
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + COLD_START_SECONDS
     while not _cdp_running():
         if time.monotonic() > deadline:
             raise RuntimeError(f"{browser} did not open its debugging port in time.")
@@ -256,6 +272,7 @@ class TabBackend:
             _keep_tab_live(page)
             _wait_for_tab_idle(page, cancel)
             seen = _turn_keys(page)
+            previous = _latest_reply_text(page)
             say("Sending the question to ChatGPT...")
             try:
                 _submit_prompt(page, prompt)
@@ -288,7 +305,7 @@ class TabBackend:
                     _scroll_tab_to_bottom(page)
                     _dismiss_prompts(page)
                     working = _is_generating(page)
-                    prompt_found, found_key = _find_reply_key(page, prompt, seen)
+                    prompt_found, found_key = _find_reply_key(page, prompt, seen, previous)
                     if found_key:
                         key = found_key
                     has_data = False
@@ -353,7 +370,7 @@ class TabBackend:
                     # Re-send at most once per question, and only when the question itself never landed on the page.
                     if (not prompt_found and not key and not working and not resent
                             and time.monotonic() - sent_at >= NO_REPLY_RETRY_SECONDS):
-                        say("No reply after 15 s. Sending the question again...")
+                        say(f"No reply after {NO_REPLY_RETRY_SECONDS} s. Sending the question again...")
                         _submit_prompt(page, prompt)
                         sent_at = time.monotonic()
                         resent = True
@@ -403,7 +420,7 @@ class TabBackend:
                     reconnected = False
             say("ChatGPT finished. Reading the full reply...")
             _scroll_tab_to_bottom(page)
-            _, final_key = _find_reply_key(page, prompt, seen)
+            _, final_key = _find_reply_key(page, prompt, seen, previous)
             final_key = final_key or key
             full_text = _reply_text(_reply_locator(page, final_key))
             text = "\n\n".join(split_reply(full_text)[emitted_chunks:]) if partial else full_text
@@ -414,12 +431,14 @@ class TabBackend:
 
 ASSISTANT_LABEL = "ChatGPT said:"
 TAB_COMPOSER_SELECTOR = 'div[contenteditable="true"][role="textbox"]'
-NO_REPLY_RETRY_SECONDS = 15
+NO_REPLY_RETRY_SECONDS = 48
 PAUSE_CONTINUE_TEXT = "please continue"
 PAUSE_WAIT_SECONDS = 30
-QUIET_POLLS = 3
+QUIET_POLLS = 2
 POLL_SECONDS = 1
-STABLE_FINISH_SECONDS = 6
+STABLE_FINISH_SECONDS = 4
+COLD_START_SECONDS = 60
+RECONNECT_SECONDS = 10
 STALL_SECONDS = 10
 THINKING_STALL_SECONDS = 90
 LOCATOR_TIMEOUT_MS = 15_000
@@ -435,11 +454,22 @@ def _turn_keys(page) -> set:
         .map(e => e.getAttribute('data-chatgpt-search-unit-key')))]"""))
 
 
-def _find_reply_key(page, prompt: str, seen: set) -> tuple[bool, Optional[str]]:
+def _latest_reply_text(page) -> str:
+    """Normalized text of the newest "ChatGPT said:" block on the page, or "" when there is none."""
+    return page.evaluate("""() => {
+        const norm = s => s.replace(/\\s+/g, ' ').trim();
+        const replies = [...document.querySelectorAll('[data-chatgpt-search-unit-key]')]
+            .filter(e => e.textContent.includes('ChatGPT said:'));
+        return replies.length ? norm(replies[replies.length - 1].textContent) : '';
+    }""")
+
+
+def _find_reply_key(page, prompt: str, seen: set, previous: str = "") -> tuple[bool, Optional[str]]:
     """Find this question's block (matched by its text, newer than `seen`) and the reply block that follows it.
 
     Returns (question_found, reply_key). The reply is the first new assistant block after the question in page
-    order. If the question text can't be found, the newest new assistant block is used instead.
+    order. If the question text can't be found, the newest new assistant block is used instead, unless its text
+    is still `previous` (the reply that was already on the page before sending), which is an old reply.
     """
     needle = " ".join(prompt.split())[:80]
     result = page.evaluate("""([needle, seen]) => {
@@ -458,9 +488,13 @@ def _find_reply_key(page, prompt: str, seen: set) -> tuple[bool, Optional[str]]:
         } else if (replies.length) {
             reply = replies[replies.length - 1];
         }
-        return {question: questionIndex >= 0, reply: reply ? reply.key : null};
+        return {question: questionIndex >= 0, reply: reply ? reply.key : null,
+                text: reply ? norm(reply.text) : ''};
     }""", [needle, list(seen)])
-    return bool(result["question"]), result["reply"]
+    reply_key = result["reply"]
+    if reply_key and not result["question"] and result["text"] == previous:
+        reply_key = None
+    return bool(result["question"]), reply_key
 
 
 def _reply_locator(page, key: Optional[str]):
@@ -481,17 +515,29 @@ def _submit_prompt(page, prompt: str) -> None:
     page.keyboard.press("Enter")
 
 
-def _chatgpt_tab(browser, create: bool = True):
+def _find_chatgpt_page(browser):
     for context in browser.contexts:
         for page in context.pages:
             if page.url.startswith("https://chatgpt.com"):
                 return page
-    if not create:
-        raise RuntimeError("No ChatGPT tab is open in the browser.")
-    context = browser.contexts[0] if browser.contexts else browser.new_context()
-    page = context.new_page()
-    page.goto("https://chatgpt.com", wait_until="domcontentloaded")
-    page.locator(TAB_COMPOSER_SELECTOR).first.wait_for(timeout=120_000)
+    return None
+
+
+def _chatgpt_tab(browser, create: bool = True):
+    """The ChatGPT tab. A freshly started browser may still be opening it, so wait before making a new tab."""
+    wait = COLD_START_SECONDS if create else RECONNECT_SECONDS
+    deadline = time.monotonic() + wait
+    page = _find_chatgpt_page(browser)
+    while page is None and time.monotonic() < deadline:
+        time.sleep(0.5)
+        page = _find_chatgpt_page(browser)
+    if page is None:
+        if not create:
+            raise RuntimeError("No ChatGPT tab is open in the browser.")
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.new_page()
+        page.goto("https://chatgpt.com", wait_until="domcontentloaded")
+    page.locator(TAB_COMPOSER_SELECTOR).first.wait_for(timeout=wait * 1000)
     return page
 
 
@@ -657,12 +703,19 @@ def _find_app_exe() -> Optional[str]:
 
 
 def _app_page(browser):
-    """The ChatGPT app's main page, which has a composer. The app is never navigated to another URL."""
-    for context in browser.contexts:
-        for page in context.pages:
-            if page.url.startswith("app://") and page.locator(TAB_COMPOSER_SELECTOR).count() > 0:
-                return page
-    raise RuntimeError("Open a chat in the ChatGPT app window that the overlay started, then try again.")
+    """The ChatGPT app's main page, which has a composer. The app is never navigated to another URL.
+
+    A freshly started app may still be loading, so this waits for the composer before giving up.
+    """
+    deadline = time.monotonic() + COLD_START_SECONDS
+    while True:
+        for context in browser.contexts:
+            for page in context.pages:
+                if page.url.startswith("app://") and page.locator(TAB_COMPOSER_SELECTOR).count() > 0:
+                    return page
+        if time.monotonic() > deadline:
+            raise RuntimeError("Open a chat in the ChatGPT app window that the overlay started, then try again.")
+        time.sleep(0.5)
 
 
 class AppBackend(TabBackend):
@@ -686,9 +739,10 @@ class AppBackend(TabBackend):
         exe = _find_app_exe()
         if exe is None:
             raise RuntimeError("The ChatGPT desktop app was not found on this computer.")
+        _clear_browser_cache(self.profile_dir)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         subprocess.Popen([exe, f"--remote-debugging-port={APP_DEBUG_PORT}", f"--user-data-dir={self.profile_dir}"])
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + COLD_START_SECONDS
         while not _cdp_running(APP_CDP_URL):
             if time.monotonic() > deadline:
                 raise RuntimeError("The ChatGPT app did not open its debugging port in time.")

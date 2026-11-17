@@ -20,8 +20,11 @@ class ArrowPath:
     speed: float = 4.0
     x: float = 0.0
     direction: int = 1
+    paused: bool = False
 
     def step(self) -> float:
+        if self.paused:
+            return self.x
         max_x = max(0.0, float(self.width - self.size))
         self.x += self.direction * self.speed
         if self.x >= max_x:

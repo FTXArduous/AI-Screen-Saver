@@ -1,17 +1,19 @@
+import ctypes
+import os
 import queue
 import random
 import threading
 import time
 import tkinter as tk
 import traceback
+from collections import deque
 from pathlib import Path
-from tkinter import simpledialog
 
 from PIL import Image, ImageTk
 
-from .backends import ApiBackend, AppBackend, BROWSER_NAMES, DesktopBackend, Reply, SendCancelled, TabBackend, WebBackend, WindowBackend
+from .background import BackgroundLoop, PLAYBACK_FPS
+from .backends import AppBackend, BROWSER_NAMES, Reply, SendCancelled, TabBackend
 from .engine import ArrowPath, IdleTracker, interval_seconds, ALLOWED_INTERVAL_MINUTES
-from .keystore import get_api_key, set_api_key
 from .questions import QUESTION_COUNT, engine_question
 from .slides import render_slides, render_text_card, split_reply
 
@@ -20,11 +22,21 @@ SLIDE_SECONDS = 2
 OVERLAY_SECONDS = 2
 ITEM_SECONDS = 4.8
 NEXT_SEND_MS = 2000
-BACKEND_NAMES = ("api", "web", "desktop", "window", "tab", "app")
+STATUS_SPEED = 45.0
+BACKEND_NAMES = ("tab", "app")
+ESC_TRIPLE_SECONDS = 1.5
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def _keep_system_awake(awake: bool) -> None:
+    """Keep Windows from sleeping or entering power saving while the screensaver runs."""
+    if os.name == "nt":
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if awake else 0))
 
 
 class Overlay:
-    def __init__(self, data_dir: Path, backend: str = "api", interval_minutes: int = 3):
+    def __init__(self, data_dir: Path, backend: str = "tab", interval_minutes: int = 3):
         self.data_dir = data_dir
         self.backend_name = backend
         self.browser = "edge"
@@ -34,21 +46,26 @@ class Overlay:
         self.revealed = False
 
         self.results: queue.Queue = queue.Queue()
-        self.ui_calls: queue.Queue = queue.Queue()
         self.display_queue: queue.Queue = queue.Queue()
         self.run_cancel = threading.Event()
-        self._was_fullscreen = True
         self.busy = False
         self.idle = IdleTracker()
         self._timer = None
+        self._escape_times: deque = deque(maxlen=3)
         self.slides: list[Path] = []
         self.slide_index = -1
         self.showing_slide = False
         self.showing_reply = False
         self.waiting_for_slides = False
         self.phase_until = time.monotonic() + OVERLAY_SECONDS
-        self._slide_photo = None
-        self._reply_photo = None
+        self._overlay_rgb = None
+        self._overlay_mask = None
+        self._overlay_photo = None
+        self._bg_image = None
+        self._bg_photo = None
+        self._bg_next = 0.0
+        self.background = BackgroundLoop(self.data_dir / "background")
+        self.background.start()
         threading.Thread(target=self._load_slides, daemon=True).start()
 
         self.root = tk.Tk()
@@ -64,6 +81,9 @@ class Overlay:
         self.root.bind("<Key-1>", self._on_key_one)
         self.root.bind("<F5>", lambda _e: self.toggle_running())
 
+        self.bg_label = tk.Label(self.root, bg="black", bd=0)
+        self.bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+
         self.arrow = tk.Label(self.root, text="\u25bc", bg="#222222", fg="white",
                               font=("Segoe UI", 8), cursor="hand2")
         self.arrow.bind("<Button-1>", lambda _e: self._show_menu())
@@ -75,7 +95,10 @@ class Overlay:
 
         self.status_label = tk.Label(self.root, text="", bg="black", fg="#aaaaaa", wraplength=1200,
                                      justify="center", font=("Segoe UI", 11))
-        self.status_label.place(relx=0.5, rely=1.0, anchor="s", y=-50)
+        self.status_label.place(x=100, y=100)
+        self._status_pos = [100.0, 100.0]
+        self._status_vel = [STATUS_SPEED, STATUS_SPEED]
+        self._status_last = time.monotonic()
 
         self.slide_label = tk.Label(self.root, bg="black", bd=0)
         self.path = ArrowPath(width=self.root.winfo_screenwidth())
@@ -99,13 +122,11 @@ class Overlay:
         for name in BROWSER_NAMES:
             browser_menu.add_radiobutton(label=name, value=name, variable=browser_var,
                                          command=lambda n=name: self.set_browser(n))
-        self.menu.add_cascade(label="Web browser", menu=browser_menu)
-        self.menu.add_command(label="Log in to ChatGPT (web)...", command=self.login_web)
+        self.menu.add_cascade(label="Browser", menu=browser_menu)
         interval_menu = tk.Menu(self.menu, tearoff=0)
         for minutes in ALLOWED_INTERVAL_MINUTES:
             interval_menu.add_command(label=f"{minutes} min", command=lambda m=minutes: self.set_interval(m))
         self.menu.add_cascade(label="Interval", menu=interval_menu)
-        self.menu.add_command(label="Set OpenAI API key...", command=self.set_api_key_dialog)
         self.menu.add_separator()
         self.menu.add_command(label="Toggle fullscreen (Esc / F11)", command=self.toggle_fullscreen)
         self.menu.add_command(label="Quit (Ctrl+Q)", command=self.quit)
@@ -129,22 +150,7 @@ class Overlay:
 
     def set_browser(self, name: str):
         self.browser = name
-        self.status_label.config(text=f"Web browser: {name}")
-
-    def login_web(self):
-        if self.busy:
-            self.status_label.config(text="Busy; try again in a moment.")
-            return
-        self.busy = True
-        self.status_label.config(text=f"Opening {self.browser} for ChatGPT login. Log in there; this waits up to 10 minutes.")
-        threading.Thread(target=self._login_worker, daemon=True).start()
-
-    def _login_worker(self):
-        try:
-            backend = WebBackend(self.data_dir / "web-profile", browser=self.browser)
-            self.results.put(("ok", backend.open_for_login(), None))
-        except Exception as exc:
-            self.results.put(("error", f"Login error: {exc}", None))
+        self.status_label.config(text=f"Browser: {name}")
 
     def _on_key_one(self, event):
         if event.widget is self.prompt_text:
@@ -154,14 +160,14 @@ class Overlay:
     def set_interval(self, minutes: int):
         self.interval_minutes = minutes
 
-    def set_api_key_dialog(self):
-        key = simpledialog.askstring("OpenAI API key", "Enter API key (stored in Windows Credential Manager):",
-                                     show="*", parent=self.root)
-        if key:
-            set_api_key(key.strip())
-            self.status_label.config(text="API key saved.")
-
     def _on_escape(self):
+        now = time.monotonic()
+        self._escape_times.append(now)
+        if len(self._escape_times) == 3 and now - self._escape_times[0] <= ESC_TRIPLE_SECONDS:
+            # Third quick Esc freezes or unfreezes the drop-down arrow and leaves fullscreen as it was.
+            self._escape_times.clear()
+            self.path.paused = not self.path.paused
+            return
         self.toggle_fullscreen()
         if self.running:
             self.revealed = not self.root.attributes("-fullscreen")
@@ -181,6 +187,7 @@ class Overlay:
         self.run_cancel = threading.Event()
         self.chrome_hidden = True
         self.revealed = False
+        _keep_system_awake(True)
         self._place_chrome()
         self._continue_loop(0)
 
@@ -188,6 +195,7 @@ class Overlay:
         self.running = False
         self.run_cancel.set()
         self.revealed = False
+        _keep_system_awake(False)
         if self._timer is not None:
             self.root.after_cancel(self._timer)
             self._timer = None
@@ -208,20 +216,9 @@ class Overlay:
         self._timer = self.root.after(delay_ms, self._fire)
 
     def _build_backend(self):
-        if self.backend_name == "web":
-            return WebBackend(self.data_dir / "web-profile", browser=self.browser)
-        if self.backend_name == "desktop":
-            return DesktopBackend()
-        if self.backend_name == "window":
-            return WindowBackend()
-        if self.backend_name == "tab":
-            return TabBackend(self.data_dir / "tab-profile", browser=self.browser)
         if self.backend_name == "app":
             return AppBackend(self.data_dir / "tab-profile")
-        key = get_api_key()
-        if not key:
-            raise RuntimeError("No OpenAI API key saved. Use 'Set OpenAI API key...' first.")
-        return ApiBackend(key)
+        return TabBackend(self.data_dir / "tab-profile", browser=self.browser)
 
     def _fire(self):
         self._timer = None
@@ -246,48 +243,16 @@ class Overlay:
         threading.Thread(target=self._worker, args=(self.backend_name, prompt, size, self.run_cancel),
                          daemon=True).start()
 
-    def _run_on_ui(self, fn):
-        """Run fn on the Tk thread and wait for it. Called from worker threads."""
-        done = threading.Event()
-        self.ui_calls.put((fn, done))
-        done.wait(15)
-
-    def _hide_for_capture(self):
-        self._was_fullscreen = bool(self.root.attributes("-fullscreen"))
-        self.root.withdraw()
-
-    def _show_after_capture(self):
-        self.root.deiconify()
-        self.root.attributes("-fullscreen", self._was_fullscreen)
-        self.root.attributes("-topmost", True)
-        self.root.focus_force()
-
     def _worker(self, backend_name: str, prompt: str, size: tuple[int, int], cancel: threading.Event):
         """Send one prompt. Results carry the run's cancel event so stale results from a stopped run are ignored."""
         try:
             backend = self._build_backend()
-            streamed = False
-            say = lambda text: self.results.put(("status", text, cancel))
-            if isinstance(backend, WindowBackend):
-                hooks = (lambda: self._run_on_ui(self._hide_for_capture),
-                         lambda: self._run_on_ui(self._show_after_capture))
-                reply = backend.send(prompt, hooks=hooks, image_dir=self.data_dir / "chatgpt-images",
-                                     cancel=cancel, status=say)
-            elif isinstance(backend, TabBackend):
-                reply = backend.send(prompt, image_dir=self.data_dir / "chatgpt-images",
-                                     cancel=cancel, status=say,
-                                     partial=lambda piece: self.results.put(
-                                         ("partial", self._render_items(piece, size), cancel)))
-                streamed = True
-            else:
-                say(f"Sending via {backend_name}...")
-                reply = backend.send(prompt)
-            if isinstance(reply, str):
-                reply = Reply(text=reply)
-            if reply and (reply.text or reply.images or streamed):
-                self.results.put(("reply", self._render_items(reply, size), cancel))
-            else:
-                self.results.put(("ok", f"Sent via {backend_name}.", cancel))
+            reply = backend.send(prompt, image_dir=self.data_dir / "chatgpt-images",
+                                 cancel=cancel, status=lambda text: self.results.put(("status", text, cancel)),
+                                 partial=lambda piece: self.results.put(
+                                     ("partial", self._render_items(piece, size), cancel)))
+            # Always report the reply, even if everything was already streamed, so the next question waits for the slides.
+            self.results.put(("reply", self._render_items(reply, size), cancel))
         except SendCancelled:
             self.results.put(("cancelled", "", cancel))
         except Exception as exc:
@@ -342,16 +307,68 @@ class Overlay:
                 self.waiting_for_slides = False
                 self._continue_loop(NEXT_SEND_MS)
             return
-        image = Image.open(path).convert("RGB")
-        if image.size != (self.root.winfo_width(), self.root.winfo_height()):
-            image = image.resize((max(1, self.root.winfo_width()), max(1, self.root.winfo_height())))
-        self._reply_photo = ImageTk.PhotoImage(image)
-        self.slide_label.config(image=self._reply_photo)
-        self.slide_label.place(x=0, y=0, relwidth=1, relheight=1)
-        self.slide_label.lift()
+        self._show_overlay(Image.open(path).convert("RGB"))
         self.showing_slide = False
         self.showing_reply = True
         self.phase_until = now + ITEM_SECONDS
+
+    def _show_overlay(self, image: Image.Image):
+        """Show a slide or card in front of the background. Dark pixels stay transparent so the background shows."""
+        size = (max(1, self.root.winfo_width()), max(1, self.root.winfo_height()))
+        self._overlay_rgb = image.resize(size)
+        self._overlay_mask = self._overlay_rgb.convert("L")
+        self._refresh_overlay()
+        self.slide_label.place(x=0, y=0, relwidth=1, relheight=1)
+        self.slide_label.lift()
+
+    def _refresh_overlay(self):
+        base = self._bg_image
+        if base is None or base.size != self._overlay_rgb.size:
+            base = Image.new("RGB", self._overlay_rgb.size, "black")
+        self._overlay_photo = ImageTk.PhotoImage(Image.composite(self._overlay_rgb, base, self._overlay_mask))
+        self.slide_label.config(image=self._overlay_photo)
+
+    def _update_background(self):
+        """Show the next rendered frame in order at PLAYBACK_FPS, holding the last frame if rendering is behind."""
+        now = time.monotonic()
+        if now < self._bg_next:
+            return
+        path = self.background.take_next()
+        if path is None:
+            return
+        self._bg_next = now + 1.0 / PLAYBACK_FPS
+        try:
+            size = (max(1, self.root.winfo_width()), max(1, self.root.winfo_height()))
+            self._bg_image = Image.open(path).convert("RGB").resize(size, Image.Resampling.BILINEAR)
+        except OSError:
+            return
+        self._bg_photo = ImageTk.PhotoImage(self._bg_image)
+        self.bg_label.config(image=self._bg_photo)
+        if self.showing_slide or self.showing_reply:
+            self._refresh_overlay()
+
+    def _bounce_status(self):
+        """Move the status text slowly, bouncing diagonally off the screen edges like a DVD logo."""
+        now = time.monotonic()
+        dt = min(0.1, now - self._status_last)
+        self._status_last = now
+        max_x = max(0, self.root.winfo_width() - self.status_label.winfo_reqwidth())
+        max_y = max(0, self.root.winfo_height() - self.status_label.winfo_reqheight())
+        x, y = self._status_pos
+        vx, vy = self._status_vel
+        x += vx * dt
+        y += vy * dt
+        if x <= 0:
+            x, vx = 0.0, abs(vx)
+        elif x >= max_x:
+            x, vx = float(max_x), -abs(vx)
+        if y <= 0:
+            y, vy = 0.0, abs(vy)
+        elif y >= max_y:
+            y, vy = float(max_y), -abs(vy)
+        self._status_pos = [x, y]
+        self._status_vel = [vx, vy]
+        self.status_label.place(x=int(x), y=int(y))
 
     def _update_slides(self):
         now = time.monotonic()
@@ -363,12 +380,7 @@ class Overlay:
             self.phase_until = now + OVERLAY_SECONDS
             return
         self.slide_index = (self.slide_index + 1) % len(self.slides)
-        image = Image.open(self.slides[self.slide_index]).convert("RGB")
-        image = image.resize((self.root.winfo_width(), self.root.winfo_height()))
-        self._slide_photo = ImageTk.PhotoImage(image)
-        self.slide_label.config(image=self._slide_photo)
-        self.slide_label.place(x=0, y=0, relwidth=1, relheight=1)
-        self.slide_label.lift()
+        self._show_overlay(Image.open(self.slides[self.slide_index]).convert("RGB"))
         self.showing_slide = True
         self.phase_until = now + SLIDE_SECONDS
 
@@ -384,18 +396,19 @@ class Overlay:
         self.path.width = self.root.winfo_width()
         if not self.chrome_hidden:
             self.arrow.place(x=int(self.path.step()), y=self.root.winfo_height() - 24)
+        self._drain_results()
         self._advance_items()
         self._update_slides()
+        self._update_background()
+        self._bounce_status()
         self.status_label.lift()
         try:
-            while True:
-                fn, done = self.ui_calls.get_nowait()
-                try:
-                    fn()
-                finally:
-                    done.set()
-        except queue.Empty:
+            self.root.config(cursor="none" if (not self.revealed and self.idle.should_hide_cursor()) else "")
+        except tk.TclError:
             pass
+
+    def _drain_results(self):
+        """Apply worker results on the Tk thread. Results from a stopped run are ignored by token."""
         try:
             while True:
                 status, payload, token = self.results.get_nowait()
@@ -418,15 +431,12 @@ class Overlay:
                     for path in payload:
                         self.display_queue.put(path)
                     self.waiting_for_slides = True
-                    self.status_label.config(text=f"Showing {len(payload)} items from ChatGPT. Next question after the last slide.")
+                    self.status_label.config(text=(f"Showing {len(payload)} items from ChatGPT. Next question after the last slide."
+                                                   if payload else "ChatGPT returned nothing to show. Next question after a short wait."))
                     continue
                 self.status_label.config(text=payload)
                 self._continue_loop(interval_seconds(self.interval_minutes) * 1000)
         except queue.Empty:
-            pass
-        try:
-            self.root.config(cursor="none" if (not self.revealed and self.idle.should_hide_cursor()) else "")
-        except tk.TclError:
             pass
 
     def toggle_fullscreen(self):
@@ -440,10 +450,9 @@ class Overlay:
 
     def run(self):
         self.root.after(200, self.root.focus_force)
-        if self.backend_name in ("window", "tab", "app"):
-            self.root.after(1500, self._start)
+        self.root.after(1500, self._start)
         self.root.mainloop()
 
 
-def run_overlay(data_dir: Path, backend: str = "api", interval_minutes: int = 3):
+def run_overlay(data_dir: Path, backend: str = "tab", interval_minutes: int = 3):
     Overlay(data_dir, backend=backend, interval_minutes=interval_minutes).run()
