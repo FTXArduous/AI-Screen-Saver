@@ -15,6 +15,8 @@ from typing import Callable, Optional
 
 from PIL import Image
 
+from .slides import split_reply
+
 API_URL = "https://api.openai.com/v1/responses"
 DEFAULT_MODEL = "gpt-4o-mini"
 
@@ -213,8 +215,13 @@ class TabBackend:
         self.profile_dir = (profile_root / browser).resolve()
 
     def send(self, prompt: str, image_dir: Optional[Path] = None, cancel: Optional[threading.Event] = None,
-             status: Optional[Callable[[str], None]] = None) -> Reply:
-        """Send the prompt and return the reply once its text and any image have finished."""
+             status: Optional[Callable[[str], None]] = None,
+             partial: Optional[Callable[[Reply], None]] = None) -> Reply:
+        """Send the prompt and return the reply once its text and any image have finished.
+
+        `partial` receives new text chunks and newly saved images while ChatGPT is still writing or rendering.
+        The returned Reply then holds only what was not already passed to `partial`.
+        """
         from playwright.sync_api import sync_playwright
 
         say = status or (lambda _text: None)
@@ -231,10 +238,12 @@ class TabBackend:
             sent_at = time.monotonic()
             say("ChatGPT is replying...")
             deadline = time.monotonic() + REPLY_TIMEOUT_SECONDS
-            last_text = ""
-            stable_since = time.monotonic()
             resent = False
             phase = ""
+            render_started = None
+            current = ""
+            emitted_chunks = 0
+            image_srcs: set = set()
             while True:
                 _pause(2, cancel)
                 _scroll_tab_to_bottom(page)
@@ -247,18 +256,29 @@ class TabBackend:
                     reply = _reply_locator(page, key)
                     turn = _reply_turn_locator(page, key)
                     current = _reply_text(reply)
-                    if current != last_text:
-                        last_text = current
-                        stable_since = time.monotonic()
                     rendering = _is_rendering_image(turn)
+                    if rendering and render_started is None:
+                        render_started = time.monotonic()
+                    elif not rendering:
+                        render_started = None
                     # A reply still drawing an image has no text yet, so the image slot counts as data.
-                    has_data = bool(current) or rendering or turn.locator("img").count() > 0
-                    settled = (time.monotonic() - stable_since >= SETTLE_SECONDS and not working
-                               and (not rendering or time.monotonic() - stable_since >= IMAGE_WAIT_SECONDS)
-                               and _images_loaded(turn)
-                               and (_has_big_image(turn)
-                                    or time.monotonic() - stable_since >= IMAGE_WAIT_SECONDS))
-                    if settled:
+                    has_images = turn.locator("img").count() > 0
+                    has_data = bool(current) or rendering or has_images
+                    # Finished means generation has stopped, every image has loaded, and no image is still rendering.
+                    render_done = not rendering or time.monotonic() - render_started >= IMAGE_WAIT_SECONDS
+                    finished = (has_data and not working and render_done
+                                and _images_loaded(turn) and (current or has_images))
+                    if partial:
+                        # The last chunk may still be growing, so it is held back until the reply is finished.
+                        chunks = split_reply(current)
+                        ready = chunks if finished else chunks[:-1]
+                        new_text = ready[emitted_chunks:]
+                        emitted_chunks = max(emitted_chunks, len(ready))
+                        new_images = (_save_tab_images(page, turn, image_dir, say, skip=image_srcs)
+                                      if image_dir and _has_big_image(turn) else [])
+                        if new_text or new_images:
+                            partial(Reply(text="\n\n".join(new_text), images=new_images))
+                    if finished:
                         break
                 # Re-send at most once per question, and only when nothing has appeared at all.
                 if (not has_data and not working and not resent
@@ -287,14 +307,15 @@ class TabBackend:
             say("ChatGPT finished. Reading the full reply...")
             _scroll_tab_to_bottom(page)
             last = _reply_locator(page, _new_reply_key(page, seen))
-            text = _reply_text(last)
-            images = _save_tab_images(page, _reply_turn_locator(page, _new_reply_key(page, seen)), image_dir, say) if image_dir else []
+            full_text = _reply_text(last)
+            text = "\n\n".join(split_reply(full_text)[emitted_chunks:]) if partial else full_text
+            images = (_save_tab_images(page, _reply_turn_locator(page, _new_reply_key(page, seen)), image_dir, say,
+                                       skip=image_srcs) if image_dir else [])
             return Reply(text=text, images=images)
 
 
 ASSISTANT_LABEL = "ChatGPT said:"
 TAB_COMPOSER_SELECTOR = 'div[contenteditable="true"][role="textbox"]'
-SETTLE_SECONDS = 6
 NO_REPLY_RETRY_SECONDS = 15
 IMAGE_WAIT_SECONDS = 180
 IMAGE_MIN_WIDTH = 200
@@ -313,7 +334,7 @@ def _new_reply_key(page, seen: set) -> Optional[str]:
         let found = null;
         for (const e of document.querySelectorAll('[data-chatgpt-search-unit-key]')) {
             const key = e.getAttribute('data-chatgpt-search-unit-key');
-            if (!seen.includes(key) && e.innerText.includes('ChatGPT said:')) found = key;
+            if (!seen.includes(key) && e.textContent.includes('ChatGPT said:')) found = key;
         }
         return found;
     }""", list(seen))
@@ -363,7 +384,7 @@ def _scroll_tab_to_bottom(page) -> None:
     try:
         page.evaluate("""() => {
             const messages = [...document.querySelectorAll('[data-chatgpt-search-unit-key]')]
-                .filter(e => e.innerText.includes('ChatGPT said:'));
+                .filter(e => e.textContent.includes('ChatGPT said:'));
             const last = messages[messages.length - 1];
             if (last) last.scrollIntoView({block: 'end'});
             for (let el = last; el; el = el.parentElement) {
@@ -445,11 +466,16 @@ def _wait_for_tab_idle(page, cancel: Optional[threading.Event]) -> None:
 
 
 def _save_tab_images(page, message, image_dir: Path, say: Callable[[str], None],
-                     min_width: int = IMAGE_MIN_WIDTH, min_height: int = IMAGE_MIN_HEIGHT) -> list[Path]:
-    """Save the large images in the latest reply as PNG files, read through the page itself (blob: URLs need it)."""
+                     min_width: int = IMAGE_MIN_WIDTH, min_height: int = IMAGE_MIN_HEIGHT,
+                     skip: Optional[set] = None) -> list[Path]:
+    """Save the large images in the latest reply as PNG files, read through the page itself (blob: URLs need it).
+
+    Sources already in `skip` are left out; saved sources are added to it, so repeated calls return only new images.
+    """
     infos = message.locator("img").evaluate_all(
         "els => els.map(e => ({src: e.currentSrc || e.src, w: e.naturalWidth, h: e.naturalHeight}))")
-    big, seen_src = [], set()
+    seen_src = skip if skip is not None else set()
+    big = []
     for index, info in enumerate(infos):
         if info["w"] >= min_width and info["h"] >= min_height and info["src"] not in seen_src:
             seen_src.add(info["src"])

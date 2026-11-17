@@ -264,6 +264,7 @@ class Overlay:
         """Send one prompt. Results carry the run's cancel event so stale results from a stopped run are ignored."""
         try:
             backend = self._build_backend()
+            streamed = False
             say = lambda text: self.results.put(("status", text, cancel))
             if isinstance(backend, WindowBackend):
                 hooks = (lambda: self._run_on_ui(self._hide_for_capture),
@@ -272,13 +273,16 @@ class Overlay:
                                      cancel=cancel, status=say)
             elif isinstance(backend, TabBackend):
                 reply = backend.send(prompt, image_dir=self.data_dir / "chatgpt-images",
-                                     cancel=cancel, status=say)
+                                     cancel=cancel, status=say,
+                                     partial=lambda piece: self.results.put(
+                                         ("partial", self._render_items(piece, size), cancel)))
+                streamed = True
             else:
                 say(f"Sending via {backend_name}...")
                 reply = backend.send(prompt)
             if isinstance(reply, str):
                 reply = Reply(text=reply)
-            if reply and (reply.text or reply.images):
+            if reply and (reply.text or reply.images or streamed):
                 self.results.put(("reply", self._render_items(reply, size), cancel))
             else:
                 self.results.put(("ok", f"Sent via {backend_name}.", cancel))
@@ -396,6 +400,12 @@ class Overlay:
                 if status == "status":
                     if token is self.run_cancel:
                         self.status_label.config(text=payload)
+                    continue
+                if status == "partial":
+                    # Streamed cards show right away; the send is still running, so the loop stays busy.
+                    if token is self.run_cancel:
+                        for path in payload:
+                            self.display_queue.put(path)
                     continue
                 self.busy = False
                 if token is not None and token is not self.run_cancel:
