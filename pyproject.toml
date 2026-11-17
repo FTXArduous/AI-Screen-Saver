@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ushi-generative-snake"
+version = "0.1.0"
+description = "USHI continuous development prototype and 21:9 cycle renderer"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "USHI contributors"}]
+dependencies = ["blake3>=0.4.1", "Pillow>=10.0"]
+
+[project.optional-dependencies]
+web = ["playwright>=1.40"]
+desktop = ["pywinauto>=0.6.8"]
+
+[project.scripts]
+ushi = "ushi.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ushi*"]

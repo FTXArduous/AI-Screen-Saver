@@ -1,0 +1,4 @@
+id,x_ly,y_ly,z_ly,vx_kms,vy_kms,vz_kms,epoch_year,frame,source
+DEMO-A,12.84,0.751,5.64,0,0,0,2026,DEMO_FRAME,synthetic_example
+DEMO-B,7.547,20.418,-33.075,0,0,0,2026,DEMO_FRAME,synthetic_example
+DEMO-C,-18.2,11.4,2.7,0,0,0,2026,DEMO_FRAME,synthetic_example
