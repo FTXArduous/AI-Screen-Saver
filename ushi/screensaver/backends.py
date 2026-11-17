@@ -69,12 +69,14 @@ BROWSER_EXECUTABLES = {
 }
 DEBUG_PORT = 9222
 CDP_URL = f"http://127.0.0.1:{DEBUG_PORT}"
+APP_DEBUG_PORT = 9223
+APP_CDP_URL = f"http://127.0.0.1:{APP_DEBUG_PORT}"
 COMPOSER_SELECTOR = "#prompt-textarea"
 
 
-def _cdp_running() -> bool:
+def _cdp_running(url: str = CDP_URL) -> bool:
     try:
-        urllib.request.urlopen(f"{CDP_URL}/json/version", timeout=1)
+        urllib.request.urlopen(f"{url}/json/version", timeout=1)
         return True
     except OSError:
         return False
@@ -214,7 +216,17 @@ class TabBackend:
         self.browser = browser
         self.profile_dir = (profile_root / browser).resolve()
 
-    def send(self, prompt: str, image_dir: Optional[Path] = None, cancel: Optional[threading.Event] = None,
+    def _ensure_browser(self) -> None:
+        _start_debug_browser(self.browser, self.profile_dir)
+
+    def _connect(self, p):
+        return p.chromium.connect_over_cdp(CDP_URL)
+
+    def _find_page(self, browser):
+        return _chatgpt_tab(browser)
+
+    def send(self, prompt: str, image_dir: Optional[Path] = None,
+             cancel: Optional[threading.Event] = None,
              status: Optional[Callable[[str], None]] = None,
              partial: Optional[Callable[[Reply], None]] = None) -> Reply:
         """Send the prompt and return the reply once its text and any image have finished.
@@ -226,10 +238,10 @@ class TabBackend:
 
         say = status or (lambda _text: None)
         say("Starting the browser for ChatGPT...")
-        _start_debug_browser(self.browser, self.profile_dir)
+        self._ensure_browser()
         with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(CDP_URL)
-            page = _chatgpt_tab(browser)
+            browser = self._connect(p)
+            page = self._find_page(browser)
             _keep_tab_live(page)
             _wait_for_tab_idle(page, cancel)
             seen = _turn_keys(page)
@@ -244,13 +256,23 @@ class TabBackend:
             current = ""
             emitted_chunks = 0
             image_srcs: set = set()
+            quiet_polls = 0
+            last_state = None
+            state_since = time.monotonic()
+            last_progress = None
+            last_progress_at = time.monotonic()
+            reconnected = False
+            key = None
             while True:
-                _pause(2, cancel)
+                _pause(POLL_SECONDS, cancel)
                 _scroll_tab_to_bottom(page)
                 _dismiss_prompts(page)
                 working = _is_generating(page)
-                key = _new_reply_key(page, seen)
+                prompt_found, found_key = _find_reply_key(page, prompt, seen)
+                if found_key:
+                    key = found_key
                 has_data = False
+                has_images = False
                 rendering = False
                 if key:
                     reply = _reply_locator(page, key)
@@ -264,9 +286,18 @@ class TabBackend:
                     # A reply still drawing an image has no text yet, so the image slot counts as data.
                     has_images = turn.locator("img").count() > 0
                     has_data = bool(current) or rendering or has_images
-                    # Finished means generation has stopped, every image has loaded, and no image is still rendering.
+                    # The reply must stay unchanged for a few polls, so an image slot that has not appeared yet is not missed.
+                    state = (current, has_images, rendering)
+                    quiet_polls = quiet_polls + 1 if state == last_state else 0
+                    if state != last_state:
+                        state_since = time.monotonic()
+                        reconnected = False
+                    last_state = state
+                    # Finished means every image has loaded and none is still rendering, and the reply has stopped changing.
+                    # A Stop control can stay on screen after ChatGPT is done, so an unchanged reply also counts as finished.
                     render_done = not rendering or time.monotonic() - render_started >= IMAGE_WAIT_SECONDS
-                    finished = (has_data and not working and render_done
+                    stable = reconnected or not working or time.monotonic() - state_since >= STABLE_FINISH_SECONDS
+                    finished = (has_data and render_done and (quiet_polls >= QUIET_POLLS or reconnected) and stable
                                 and _images_loaded(turn) and (current or has_images))
                     if partial:
                         # The last chunk may still be growing, so it is held back until the reply is finished.
@@ -280,8 +311,8 @@ class TabBackend:
                             partial(Reply(text="\n\n".join(new_text), images=new_images))
                     if finished:
                         break
-                # Re-send at most once per question, and only when nothing has appeared at all.
-                if (not has_data and not working and not resent
+                # Re-send at most once per question, and only when the question itself never landed on the page.
+                if (not prompt_found and not key and not working and not resent
                         and time.monotonic() - sent_at >= NO_REPLY_RETRY_SECONDS):
                     say("No reply after 15 s. Sending the question again...")
                     _submit_prompt(page, prompt)
@@ -302,14 +333,32 @@ class TabBackend:
                          "writing": "ChatGPT is writing...",
                          "thinking": "ChatGPT is thinking...",
                          "waiting": "ChatGPT is replying..."}[phase])
+                progress = (current, has_images, rendering, phase)
+                if progress != last_progress:
+                    last_progress = progress
+                    last_progress_at = time.monotonic()
+                elif time.monotonic() - last_progress_at >= STALL_SECONDS:
+                    # Reconnect only. The prompt is never sent again, so a stall cannot cause a second question.
+                    say("ChatGPT has not changed for 10 s. Reconnecting to the tab...")
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    browser = self._connect(p)
+                    page = self._find_page(browser)
+                    _keep_tab_live(page)
+                    last_progress_at = time.monotonic()
+                    # The reply already on the page is complete as far as the screen shows, so it is finished now.
+                    reconnected = True
                 if time.monotonic() > deadline:
                     raise RuntimeError("ChatGPT did not finish replying in time.")
             say("ChatGPT finished. Reading the full reply...")
             _scroll_tab_to_bottom(page)
-            last = _reply_locator(page, _new_reply_key(page, seen))
-            full_text = _reply_text(last)
+            _, final_key = _find_reply_key(page, prompt, seen)
+            final_key = final_key or key
+            full_text = _reply_text(_reply_locator(page, final_key))
             text = "\n\n".join(split_reply(full_text)[emitted_chunks:]) if partial else full_text
-            images = (_save_tab_images(page, _reply_turn_locator(page, _new_reply_key(page, seen)), image_dir, say,
+            images = (_save_tab_images(page, _reply_turn_locator(page, final_key), image_dir, say,
                                        skip=image_srcs) if image_dir else [])
             return Reply(text=text, images=images)
 
@@ -317,6 +366,10 @@ class TabBackend:
 ASSISTANT_LABEL = "ChatGPT said:"
 TAB_COMPOSER_SELECTOR = 'div[contenteditable="true"][role="textbox"]'
 NO_REPLY_RETRY_SECONDS = 15
+QUIET_POLLS = 3
+POLL_SECONDS = 1
+STABLE_FINISH_SECONDS = 6
+STALL_SECONDS = 10
 IMAGE_WAIT_SECONDS = 180
 IMAGE_MIN_WIDTH = 200
 IMAGE_MIN_HEIGHT = 120
@@ -328,16 +381,32 @@ def _turn_keys(page) -> set:
         .map(e => e.getAttribute('data-chatgpt-search-unit-key')))]"""))
 
 
-def _new_reply_key(page, seen: set) -> Optional[str]:
-    """Key of the newest reply block whose turn did not exist before the send, or None."""
-    return page.evaluate("""(seen) => {
-        let found = null;
-        for (const e of document.querySelectorAll('[data-chatgpt-search-unit-key]')) {
-            const key = e.getAttribute('data-chatgpt-search-unit-key');
-            if (!seen.includes(key) && e.textContent.includes('ChatGPT said:')) found = key;
+def _find_reply_key(page, prompt: str, seen: set) -> tuple[bool, Optional[str]]:
+    """Find this question's block (matched by its text, newer than `seen`) and the reply block that follows it.
+
+    Returns (question_found, reply_key). The reply is the first new assistant block after the question in page
+    order. If the question text can't be found, the newest new assistant block is used instead.
+    """
+    needle = " ".join(prompt.split())[:80]
+    result = page.evaluate("""([needle, seen]) => {
+        const norm = s => s.replace(/\\s+/g, ' ').trim();
+        const blocks = [...document.querySelectorAll('[data-chatgpt-search-unit-key]')]
+            .map(e => ({key: e.getAttribute('data-chatgpt-search-unit-key'), text: e.textContent}))
+            .filter(b => !seen.includes(b.key));
+        let questionIndex = -1;
+        blocks.forEach((b, i) => {
+            if (!b.text.includes('ChatGPT said:') && norm(b.text).includes(needle)) questionIndex = i;
+        });
+        const replies = blocks.map((b, i) => ({...b, i})).filter(b => b.text.includes('ChatGPT said:'));
+        let reply = null;
+        if (questionIndex >= 0) {
+            reply = replies.find(b => b.i > questionIndex) || null;
+        } else if (replies.length) {
+            reply = replies[replies.length - 1];
         }
-        return found;
-    }""", list(seen))
+        return {question: questionIndex >= 0, reply: reply ? reply.key : null};
+    }""", [needle, list(seen)])
+    return bool(result["question"]), result["reply"]
 
 
 def _reply_locator(page, key: Optional[str]):
@@ -440,12 +509,14 @@ def _images_loaded(message) -> bool:
 
 
 def _is_rendering_image(message) -> bool:
-    """True while ChatGPT is still drawing an image: an image is loading, or an image slot has no large image yet."""
+    """True while ChatGPT is still drawing an image: an image is loading, an image slot has no large image yet,
+    or a "creating an image" placeholder is shown with no large image yet."""
     return message.evaluate("""(el) => {
         const imgs = [...el.querySelectorAll('img')];
         const slots = el.querySelectorAll('[data-testid*="generated-image"]').length;
         const loaded = imgs.some(i => i.complete && i.naturalWidth >= 200 && i.naturalHeight >= 120);
-        return imgs.some(i => !i.complete) || (slots > 0 && !loaded);
+        const placeholder = /(creating|generating|rendering|drawing) (an? )?image/i.test(el.textContent);
+        return imgs.some(i => !i.complete) || (slots > 0 && !loaded) || (!loaded && placeholder);
     }""")
 
 
@@ -504,6 +575,64 @@ def _save_tab_images(page, message, image_dir: Path, say: Callable[[str], None],
             message.locator("img").nth(index).screenshot(path=str(path))
         paths.append(path)
     return paths
+
+
+def _find_app_exe() -> Optional[str]:
+    """The ChatGPT desktop app's executable, found through its Store package, or None."""
+    command = "(Get-AppxPackage -Name 'OpenAI.Codex' | Select-Object -First 1).InstallLocation"
+    try:
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", command],
+                                capture_output=True, text=True, timeout=30,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    location = result.stdout.strip()
+    exe = Path(location) / "app" / "ChatGPT.exe"
+    return str(exe) if location and exe.is_file() else None
+
+
+def _app_page(browser):
+    """The ChatGPT app's main page, which has a composer. The app is never navigated to another URL."""
+    for context in browser.contexts:
+        for page in context.pages:
+            if page.url.startswith("app://") and page.locator(TAB_COMPOSER_SELECTOR).count() > 0:
+                return page
+    raise RuntimeError("Open a chat in the ChatGPT app window that the overlay started, then try again.")
+
+
+class AppBackend(TabBackend):
+    """Sends and reads through the ChatGPT desktop app, started by the overlay with its own profile and debug port.
+
+    The app runs in a separate profile under the data directory, so the app you already use is not touched.
+    Sign in once in the window that opens. Reply reading uses the same page selectors as the tab backend,
+    which have not been verified against a desktop chat yet.
+    Requires `pip install -e .[web]`.
+    """
+    name = "app"
+
+    def __init__(self, profile_root: Path):
+        self.browser = "app"
+        self.profile_dir = (profile_root / "desktop-app").resolve()
+
+    def _ensure_browser(self) -> None:
+        if _cdp_running(APP_CDP_URL):
+            return
+        exe = _find_app_exe()
+        if exe is None:
+            raise RuntimeError("The ChatGPT desktop app was not found on this computer.")
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen([exe, f"--remote-debugging-port={APP_DEBUG_PORT}", f"--user-data-dir={self.profile_dir}"])
+        deadline = time.monotonic() + 30
+        while not _cdp_running(APP_CDP_URL):
+            if time.monotonic() > deadline:
+                raise RuntimeError("The ChatGPT app did not open its debugging port in time.")
+            time.sleep(0.5)
+
+    def _connect(self, p):
+        return p.chromium.connect_over_cdp(APP_CDP_URL)
+
+    def _find_page(self, browser):
+        return _app_page(browser)
 
 
 class DesktopBackend:

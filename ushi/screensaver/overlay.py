@@ -9,7 +9,7 @@ from tkinter import simpledialog
 
 from PIL import Image, ImageTk
 
-from .backends import ApiBackend, BROWSER_NAMES, DesktopBackend, Reply, SendCancelled, TabBackend, WebBackend, WindowBackend
+from .backends import ApiBackend, AppBackend, BROWSER_NAMES, DesktopBackend, Reply, SendCancelled, TabBackend, WebBackend, WindowBackend
 from .engine import ArrowPath, IdleTracker, interval_seconds, ALLOWED_INTERVAL_MINUTES
 from .keystore import get_api_key, set_api_key
 from .questions import QUESTION_COUNT, engine_question
@@ -20,7 +20,7 @@ SLIDE_SECONDS = 2
 OVERLAY_SECONDS = 2
 ITEM_SECONDS = 4.8
 NEXT_SEND_MS = 2000
-BACKEND_NAMES = ("api", "web", "desktop", "window", "tab")
+BACKEND_NAMES = ("api", "web", "desktop", "window", "tab", "app")
 
 
 class Overlay:
@@ -216,6 +216,8 @@ class Overlay:
             return WindowBackend()
         if self.backend_name == "tab":
             return TabBackend(self.data_dir / "tab-profile", browser=self.browser)
+        if self.backend_name == "app":
+            return AppBackend(self.data_dir / "tab-profile")
         key = get_api_key()
         if not key:
             raise RuntimeError("No OpenAI API key saved. Use 'Set OpenAI API key...' first.")
@@ -438,7 +440,7 @@ class Overlay:
 
     def run(self):
         self.root.after(200, self.root.focus_force)
-        if self.backend_name in ("window", "tab"):
+        if self.backend_name in ("window", "tab", "app"):
             self.root.after(1500, self._start)
         self.root.mainloop()
 
