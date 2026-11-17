@@ -225,6 +225,9 @@ class TabBackend:
     def _find_page(self, browser):
         return _chatgpt_tab(browser)
 
+    def _find_open_page(self, browser):
+        return _chatgpt_tab(browser, create=False)
+
     def send(self, prompt: str, image_dir: Optional[Path] = None,
              cancel: Optional[threading.Event] = None,
              status: Optional[Callable[[str], None]] = None,
@@ -340,16 +343,18 @@ class TabBackend:
                 elif time.monotonic() - last_progress_at >= STALL_SECONDS:
                     # Reconnect only. The prompt is never sent again, so a stall cannot cause a second question.
                     say("ChatGPT has not changed for 10 s. Reconnecting to the tab...")
+                    # Attach again to the existing tab only. The browser is never closed and no tab is opened.
                     try:
-                        browser.close()
+                        browser = self._connect(p)
+                        page = self._find_open_page(browser)
                     except Exception:
-                        pass
-                    browser = self._connect(p)
-                    page = self._find_page(browser)
-                    _keep_tab_live(page)
-                    last_progress_at = time.monotonic()
-                    # The reply already on the page is complete as far as the screen shows, so it is finished now.
-                    reconnected = True
+                        say("Could not reconnect yet. Still watching the ChatGPT tab...")
+                        last_progress_at = time.monotonic()
+                    else:
+                        _keep_tab_live(page)
+                        last_progress_at = time.monotonic()
+                        # The reply already on the page is complete as far as the screen shows, so it is finished now.
+                        reconnected = True
                 if time.monotonic() > deadline:
                     raise RuntimeError("ChatGPT did not finish replying in time.")
             say("ChatGPT finished. Reading the full reply...")
@@ -427,11 +432,13 @@ def _submit_prompt(page, prompt: str) -> None:
     page.keyboard.press("Enter")
 
 
-def _chatgpt_tab(browser):
+def _chatgpt_tab(browser, create: bool = True):
     for context in browser.contexts:
         for page in context.pages:
             if page.url.startswith("https://chatgpt.com"):
                 return page
+    if not create:
+        raise RuntimeError("No ChatGPT tab is open in the browser.")
     context = browser.contexts[0] if browser.contexts else browser.new_context()
     page = context.new_page()
     page.goto("https://chatgpt.com", wait_until="domcontentloaded")
@@ -632,6 +639,9 @@ class AppBackend(TabBackend):
         return p.chromium.connect_over_cdp(APP_CDP_URL)
 
     def _find_page(self, browser):
+        return _app_page(browser)
+
+    def _find_open_page(self, browser):
         return _app_page(browser)
 
 
