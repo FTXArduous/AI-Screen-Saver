@@ -235,6 +235,7 @@ class TabBackend:
             shown = ""
             last_text = ""
             stable_since = time.monotonic()
+            resent = False
             phase = ""
             while True:
                 _pause(2, cancel)
@@ -242,8 +243,10 @@ class TabBackend:
                 _dismiss_prompts(page)
                 working = _is_generating(page)
                 key = _new_reply_key(page, seen)
+                has_data = False
                 if key:
                     reply = _reply_locator(page, key)
+                    turn = _reply_turn_locator(page, key)
                     current = _reply_text(reply)
                     if current != last_text:
                         last_text = current
@@ -251,17 +254,21 @@ class TabBackend:
                     if partial and current and current != shown:
                         shown = current
                         partial(current)
+                    # A reply still rendering an image has no text yet, so count any reply image as data.
+                    has_data = bool(current) or turn.locator("img").count() > 0
                     settled = (time.monotonic() - stable_since >= SETTLE_SECONDS and not working
-                               and _images_loaded(_reply_turn_locator(page, key))
-                               and (_has_big_image(_reply_turn_locator(page, key))
+                               and _images_loaded(turn)
+                               and (_has_big_image(turn)
                                     or time.monotonic() - stable_since >= IMAGE_WAIT_SECONDS))
                     if settled:
                         break
-                has_data = bool(last_text)
-                if not has_data and not working and time.monotonic() - sent_at >= NO_REPLY_RETRY_SECONDS:
+                # Re-send at most once per question, and only when nothing has appeared at all.
+                if (not has_data and not working and not resent
+                        and time.monotonic() - sent_at >= NO_REPLY_RETRY_SECONDS):
                     say("No reply after 15 s. Sending the question again...")
                     _submit_prompt(page, prompt)
                     sent_at = time.monotonic()
+                    resent = True
                     continue
                 now_phase = "writing" if has_data else ("thinking" if working else "waiting")
                 if now_phase != phase:

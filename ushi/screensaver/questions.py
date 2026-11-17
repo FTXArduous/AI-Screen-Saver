@@ -35,16 +35,43 @@ BASES = (2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 20, 24)
 QUESTION_COUNT = len(TARGETS)
 
 
+QUESTION_TEMPLATES = (
+    "Work out the distance to {name} in light-years ({reference}), then restate it in base {base} "
+    "to 24 digits after the radix point, and say which {band} light-year increment it sits in.",
+    "Imagine a surveyor marking {band} light-year steps out from the Sun. Where does {name} land on that scale? "
+    "Give the position in base {base} with 24 fractional digits.",
+    "Compare {name} against the {band} light-year increment ladder. Report the fractional offset in base {base}, "
+    "carried out to 24 digits.",
+    "Estimate how far {name} is from us using {reference}. Write the result in base {base}, "
+    "keeping 24 digits past the point.",
+    "If light spent the whole trip to {name} crossing {band}-light-year steps, how many steps would that take? "
+    "Answer in base {base} with 24 places after the point.",
+    "Name the {band} light-year bracket that holds {name}, then express the exact remainder in base {base} "
+    "with 24 decimal digits.",
+    "Starting from {reference}, place {name} on a Milky Way map, state its distance in base {base} to 24 digits, "
+    "and include a 21:9 ultrawide map image with the distance labeled.",
+    "Give {name}'s distance as a base-{base} number with 24 digits, then describe the {band} increment it falls in.",
+    "Using only {reference} as input, convert the distance to {name} into base {base} and carry 24 digits "
+    "after the radix point.",
+    "How far is {name} from the Sun in {band}-light-year steps? Give the count in base {base} to 24 places.",
+    "Mark {name} on a radial scale that starts at the Sun. Read the value in base {base}, 24 digits after the point, "
+    "and add a 21:9 ultrawide sketch of that scale.",
+    "Split the distance to {name} into a whole part and a fraction of one {band}-light-year step. "
+    "Write the fraction in base {base} to 24 digits.",
+    "What fraction of the way from the Sun to the edge of the disk is {name}? Express it in base {base} "
+    "with 24 digits, and note the {band} increment it falls in.",
+    "Write the distance to {name} as a sum of {band}-light-year blocks and a remainder. "
+    "Give the remainder in base {base} to 24 digits.",
+    "Chart {name} along a Milky Way map from the Sun outward. Give its distance in base {base} to 24 digits "
+    "and produce a 21:9 ultrawide map image that marks it.",
+    "Report the distance to {name} in light-years, rewrite it in base {base}, and confirm it to 24 digits "
+    "after the point, noting the {band} increment.",
+)
+
+
 def engine_question(index: int) -> str:
-    """Return the distance question for one target, written in that target's number base."""
+    """Return one distance question: its own target, its own base, and its own wording."""
     target = TARGETS[index % len(TARGETS)]
     base = BASES[index % len(BASES)]
-    return (
-        f"Using the Milky Way as the reference, give the distance for {target.name}, "
-        f"reference value {target.reference}, in light-years. "
-        f"Place it in the {target.band} light-year increment and state where it falls within that increment. "
-        f"Express the answer in base {base}: state the base first, give up to 24 digits after the radix point, "
-        f"and keep the digit grouping consistent. "
-        f"Also generate a 21:9 ultrawide image of a Milky Way map that shows {target.name}, "
-        f"with the distance labeled on the map."
-    )
+    template = QUESTION_TEMPLATES[index % len(QUESTION_TEMPLATES)]
+    return template.format(name=target.name, reference=target.reference, band=target.band, base=base)
