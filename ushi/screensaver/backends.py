@@ -221,7 +221,7 @@ class TabBackend:
         _start_debug_browser(self.browser, self.profile_dir)
 
     def _connect(self, p):
-        return p.chromium.connect_over_cdp(CDP_URL)
+        return p.chromium.connect_over_cdp(CDP_URL, timeout=CONNECT_TIMEOUT_MS)
 
     def _find_page(self, browser):
         return _chatgpt_tab(browser)
@@ -376,10 +376,10 @@ class TabBackend:
                     if progress != last_progress:
                         last_progress = progress
                         last_progress_at = time.monotonic()
-                    elif time.monotonic() - last_progress_at >= STALL_SECONDS:
+                    elif time.monotonic() - last_progress_at >= (
+                            IMAGE_WAIT_SECONDS if rendering else THINKING_STALL_SECONDS if working else STALL_SECONDS):
                         # Reconnect only. The prompt is never sent again, so a stall cannot cause a second question.
-                        say(f"ChatGPT has not changed for 10 s. Reconnecting to the {self.label}...")
-                        # Attach again to the existing page only. The prompt is never sent again.
+                        say(f"ChatGPT has not changed for a while. Reconnecting to the {self.label}...")
                         try:
                             page = self._reattach(p)
                         except Exception:
@@ -387,8 +387,8 @@ class TabBackend:
                             last_progress_at = time.monotonic()
                         else:
                             last_progress_at = time.monotonic()
-                            # The reply already on the page is complete as far as the screen shows, so it is finished now.
-                            reconnected = True
+                            # Only a reply that is no longer being written can be finished on reconnect.
+                            reconnected = not working
                     if time.monotonic() > deadline:
                         raise RuntimeError("ChatGPT did not finish replying in time.")
                 except PlaywrightTimeout:
@@ -421,6 +421,9 @@ QUIET_POLLS = 3
 POLL_SECONDS = 1
 STABLE_FINISH_SECONDS = 6
 STALL_SECONDS = 10
+THINKING_STALL_SECONDS = 90
+LOCATOR_TIMEOUT_MS = 15_000
+CONNECT_TIMEOUT_MS = 15_000
 IMAGE_WAIT_SECONDS = 180
 IMAGE_MIN_WIDTH = 200
 IMAGE_MIN_HEIGHT = 120
@@ -494,6 +497,7 @@ def _chatgpt_tab(browser, create: bool = True):
 
 def _keep_tab_live(page) -> None:
     """Make the tab behave as focused while the overlay covers it, so ChatGPT keeps rendering and streaming."""
+    page.set_default_timeout(LOCATOR_TIMEOUT_MS)
     try:
         session = page.context.new_cdp_session(page)
         session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
@@ -696,7 +700,7 @@ class AppBackend(TabBackend):
         return super()._reattach(p)
 
     def _connect(self, p):
-        return p.chromium.connect_over_cdp(APP_CDP_URL)
+        return p.chromium.connect_over_cdp(APP_CDP_URL, timeout=CONNECT_TIMEOUT_MS)
 
     def _find_page(self, browser):
         return _app_page(browser)
