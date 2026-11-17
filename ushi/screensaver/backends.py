@@ -213,9 +213,8 @@ class TabBackend:
         self.profile_dir = (profile_root / browser).resolve()
 
     def send(self, prompt: str, image_dir: Optional[Path] = None, cancel: Optional[threading.Event] = None,
-             status: Optional[Callable[[str], None]] = None,
-             partial: Optional[Callable[[str], None]] = None) -> Reply:
-        """`partial` receives the reply text as it grows while ChatGPT is still writing."""
+             status: Optional[Callable[[str], None]] = None) -> Reply:
+        """Send the prompt and return the reply once its text and any image have finished."""
         from playwright.sync_api import sync_playwright
 
         say = status or (lambda _text: None)
@@ -232,7 +231,6 @@ class TabBackend:
             sent_at = time.monotonic()
             say("ChatGPT is replying...")
             deadline = time.monotonic() + REPLY_TIMEOUT_SECONDS
-            shown = ""
             last_text = ""
             stable_since = time.monotonic()
             resent = False
@@ -244,6 +242,7 @@ class TabBackend:
                 working = _is_generating(page)
                 key = _new_reply_key(page, seen)
                 has_data = False
+                rendering = False
                 if key:
                     reply = _reply_locator(page, key)
                     turn = _reply_turn_locator(page, key)
@@ -251,12 +250,11 @@ class TabBackend:
                     if current != last_text:
                         last_text = current
                         stable_since = time.monotonic()
-                    if partial and current and current != shown:
-                        shown = current
-                        partial(current)
-                    # A reply still rendering an image has no text yet, so count any reply image as data.
-                    has_data = bool(current) or turn.locator("img").count() > 0
+                    rendering = _is_rendering_image(turn)
+                    # A reply still drawing an image has no text yet, so the image slot counts as data.
+                    has_data = bool(current) or rendering or turn.locator("img").count() > 0
                     settled = (time.monotonic() - stable_since >= SETTLE_SECONDS and not working
+                               and (not rendering or time.monotonic() - stable_since >= IMAGE_WAIT_SECONDS)
                                and _images_loaded(turn)
                                and (_has_big_image(turn)
                                     or time.monotonic() - stable_since >= IMAGE_WAIT_SECONDS))
@@ -270,10 +268,18 @@ class TabBackend:
                     sent_at = time.monotonic()
                     resent = True
                     continue
-                now_phase = "writing" if has_data else ("thinking" if working else "waiting")
+                if rendering:
+                    now_phase = "rendering"
+                elif has_data and current:
+                    now_phase = "writing"
+                elif working:
+                    now_phase = "thinking"
+                else:
+                    now_phase = "waiting"
                 if now_phase != phase:
                     phase = now_phase
-                    say({"writing": "ChatGPT is writing...",
+                    say({"rendering": "ChatGPT is rendering an image...",
+                         "writing": "ChatGPT is writing...",
                          "thinking": "ChatGPT is thinking...",
                          "waiting": "ChatGPT is replying..."}[phase])
                 if time.monotonic() > deadline:
@@ -412,6 +418,16 @@ def _images_loaded(message) -> bool:
     return message.locator("img").evaluate_all("els => els.every(e => e.complete)")
 
 
+def _is_rendering_image(message) -> bool:
+    """True while ChatGPT is still drawing an image: an image is loading, or an image slot has no large image yet."""
+    return message.evaluate("""(el) => {
+        const imgs = [...el.querySelectorAll('img')];
+        const slots = el.querySelectorAll('[data-testid*="generated-image"]').length;
+        const loaded = imgs.some(i => i.complete && i.naturalWidth >= 200 && i.naturalHeight >= 120);
+        return imgs.some(i => !i.complete) || (slots > 0 && !loaded);
+    }""")
+
+
 def _has_big_image(message) -> bool:
     """True once the reply holds at least one large, fully loaded image."""
     return message.locator("img").evaluate_all(
@@ -430,11 +446,14 @@ def _wait_for_tab_idle(page, cancel: Optional[threading.Event]) -> None:
 
 def _save_tab_images(page, message, image_dir: Path, say: Callable[[str], None],
                      min_width: int = IMAGE_MIN_WIDTH, min_height: int = IMAGE_MIN_HEIGHT) -> list[Path]:
-    """Save the large images in the latest reply as PNG files, fetched through the page's own session."""
+    """Save the large images in the latest reply as PNG files, read through the page itself (blob: URLs need it)."""
     infos = message.locator("img").evaluate_all(
         "els => els.map(e => ({src: e.currentSrc || e.src, w: e.naturalWidth, h: e.naturalHeight}))")
-    big = [(index, info) for index, info in enumerate(infos)
-           if info["w"] >= min_width and info["h"] >= min_height]
+    big, seen_src = [], set()
+    for index, info in enumerate(infos):
+        if info["w"] >= min_width and info["h"] >= min_height and info["src"] not in seen_src:
+            seen_src.add(info["src"])
+            big.append((index, info))
     if not big:
         return []
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -444,10 +463,16 @@ def _save_tab_images(page, message, image_dir: Path, say: Callable[[str], None],
         say(f"Saving image {number} of {len(big)} from ChatGPT...")
         path = image_dir / f"chatgpt-image-{stamp}-{number}.png"
         try:
-            if info["src"].startswith("data:"):
-                data = base64.b64decode(info["src"].split(",", 1)[1])
-            else:
-                data = page.context.request.get(info["src"]).body()
+            data_url = page.evaluate("""async (src) => {
+                const blob = await (await fetch(src)).blob();
+                return await new Promise((ok, fail) => {
+                    const reader = new FileReader();
+                    reader.onload = () => ok(reader.result);
+                    reader.onerror = fail;
+                    reader.readAsDataURL(blob);
+                });
+            }""", info["src"])
+            data = base64.b64decode(data_url.split(",", 1)[1])
             Image.open(io.BytesIO(data)).convert("RGB").save(path)
         except Exception:
             message.locator("img").nth(index).screenshot(path=str(path))

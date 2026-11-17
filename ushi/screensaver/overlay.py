@@ -45,6 +45,7 @@ class Overlay:
         self.slide_index = -1
         self.showing_slide = False
         self.showing_reply = False
+        self.waiting_for_slides = False
         self.phase_until = time.monotonic() + OVERLAY_SECONDS
         self._slide_photo = None
         self._reply_photo = None
@@ -191,6 +192,7 @@ class Overlay:
             self.root.after_cancel(self._timer)
             self._timer = None
         self._clear_items()
+        self.waiting_for_slides = False
         if self.showing_reply:
             self.showing_reply = False
             self.slide_label.place_forget()
@@ -263,34 +265,21 @@ class Overlay:
         try:
             backend = self._build_backend()
             say = lambda text: self.results.put(("status", text, cancel))
-            reply_shown = 0
             if isinstance(backend, WindowBackend):
                 hooks = (lambda: self._run_on_ui(self._hide_for_capture),
                          lambda: self._run_on_ui(self._show_after_capture))
                 reply = backend.send(prompt, hooks=hooks, image_dir=self.data_dir / "chatgpt-images",
                                      cancel=cancel, status=say)
             elif isinstance(backend, TabBackend):
-                shown = {"chunks": 0}
-
-                def stream(text: str) -> None:
-                    # The last paragraph may still be growing, so only finished chunks are shown early.
-                    chunks = split_reply(text)[:-1]
-                    if len(chunks) > shown["chunks"]:
-                        cards = [render_text_card(str(n), chunk, *size)
-                                 for n, chunk in enumerate(chunks[shown["chunks"]:], shown["chunks"] + 1)]
-                        shown["chunks"] = len(chunks)
-                        self.results.put(("partial", self._save_cards(cards), cancel))
-
                 reply = backend.send(prompt, image_dir=self.data_dir / "chatgpt-images",
-                                     cancel=cancel, status=say, partial=stream)
-                reply_shown = shown["chunks"]
+                                     cancel=cancel, status=say)
             else:
                 say(f"Sending via {backend_name}...")
                 reply = backend.send(prompt)
             if isinstance(reply, str):
                 reply = Reply(text=reply)
             if reply and (reply.text or reply.images):
-                self.results.put(("reply", self._render_items(reply, size, reply_shown), cancel))
+                self.results.put(("reply", self._render_items(reply, size), cancel))
             else:
                 self.results.put(("ok", f"Sent via {backend_name}.", cancel))
         except SendCancelled:
@@ -311,14 +300,17 @@ class Overlay:
             paths.append(path)
         return paths
 
-    def _render_items(self, reply: Reply, size: tuple[int, int], shown: int = 0) -> list[Path]:
-        """Render the reply's cards in display order. The first `shown` text chunks were already streamed."""
+    def _render_items(self, reply: Reply, size: tuple[int, int]) -> list[Path]:
+        """Render the reply as cards. Each image card carries the next piece of the reply's text."""
         width, height = size
         chunks = split_reply(reply.text)
-        cards = [render_text_card(f"image {n}", "", width, height, images=[picture])
-                 for n, picture in enumerate(reply.images, 1)]
+        cards = []
+        for n, picture in enumerate(reply.images, 1):
+            body = chunks.pop(0) if chunks else ""
+            cards.append(render_text_card(f"image {n}", body, width, height, images=[picture]))
+        start = len(reply.images) + 1
         cards += [render_text_card(str(n), chunk, width, height)
-                  for n, chunk in enumerate(chunks[shown:], shown + 1)]
+                  for n, chunk in enumerate(chunks, start)]
         return self._save_cards(cards)
 
     def _clear_items(self):
@@ -339,6 +331,10 @@ class Overlay:
             if self.showing_reply:
                 self.showing_reply = False
                 self.slide_label.place_forget()
+            if self.waiting_for_slides:
+                # The reply's last slide has finished, so the next question can go out.
+                self.waiting_for_slides = False
+                self._continue_loop(NEXT_SEND_MS)
             return
         image = Image.open(path).convert("RGB")
         if image.size != (self.root.winfo_width(), self.root.winfo_height()):
@@ -401,11 +397,6 @@ class Overlay:
                     if token is self.run_cancel:
                         self.status_label.config(text=payload)
                     continue
-                if status == "partial":
-                    if token is self.run_cancel:
-                        for path in payload:
-                            self.display_queue.put(path)
-                    continue
                 self.busy = False
                 if token is not None and token is not self.run_cancel:
                     continue
@@ -414,8 +405,8 @@ class Overlay:
                 if status == "reply":
                     for path in payload:
                         self.display_queue.put(path)
-                    self.status_label.config(text=f"Showing {len(payload)} items from ChatGPT. Next question in {NEXT_SEND_MS // 1000} s.")
-                    self._continue_loop(NEXT_SEND_MS)
+                    self.waiting_for_slides = True
+                    self.status_label.config(text=f"Showing {len(payload)} items from ChatGPT. Next question after the last slide.")
                     continue
                 self.status_label.config(text=payload)
                 self._continue_loop(interval_seconds(self.interval_minutes) * 1000)
