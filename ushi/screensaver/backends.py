@@ -446,19 +446,27 @@ CONNECT_TIMEOUT_MS = 15_000
 IMAGE_WAIT_SECONDS = 180
 IMAGE_MIN_WIDTH = 200
 IMAGE_MIN_HEIGHT = 120
+SEARCH_UNIT_SELECTOR = "[data-chatgpt-search-unit-key], [data-content-search-unit-key]"
+
+
+def _unit_selector(key: Optional[str] = None) -> str:
+    """Selector for chat message blocks. The web page and the desktop app use different attribute names."""
+    if key is None:
+        return SEARCH_UNIT_SELECTOR
+    return f'[data-chatgpt-search-unit-key="{key}"], [data-content-search-unit-key="{key}"]'
 
 
 def _turn_keys(page) -> set:
     """Identifiers of every question and reply already on the page, so only new ones count."""
-    return set(page.evaluate("""() => [...new Set([...document.querySelectorAll('[data-chatgpt-search-unit-key]')]
-        .map(e => e.getAttribute('data-chatgpt-search-unit-key')))]"""))
+    return set(page.evaluate("""() => [...new Set([...document.querySelectorAll('[data-chatgpt-search-unit-key], [data-content-search-unit-key]')]
+        .map(e => e.getAttribute('data-chatgpt-search-unit-key') || e.getAttribute('data-content-search-unit-key')))]"""))
 
 
 def _latest_reply_text(page) -> str:
     """Normalized text of the newest "ChatGPT said:" block on the page, or "" when there is none."""
     return page.evaluate("""() => {
         const norm = s => s.replace(/\\s+/g, ' ').trim();
-        const replies = [...document.querySelectorAll('[data-chatgpt-search-unit-key]')]
+        const replies = [...document.querySelectorAll('[data-chatgpt-search-unit-key], [data-content-search-unit-key]')]
             .filter(e => e.textContent.includes('ChatGPT said:'));
         return replies.length ? norm(replies[replies.length - 1].textContent) : '';
     }""")
@@ -474,8 +482,8 @@ def _find_reply_key(page, prompt: str, seen: set, previous: str = "") -> tuple[b
     needle = " ".join(prompt.split())[:80]
     result = page.evaluate("""([needle, seen]) => {
         const norm = s => s.replace(/\\s+/g, ' ').trim();
-        const blocks = [...document.querySelectorAll('[data-chatgpt-search-unit-key]')]
-            .map(e => ({key: e.getAttribute('data-chatgpt-search-unit-key'), text: e.textContent}))
+        const blocks = [...document.querySelectorAll('[data-chatgpt-search-unit-key], [data-content-search-unit-key]')]
+            .map(e => ({key: e.getAttribute('data-chatgpt-search-unit-key') || e.getAttribute('data-content-search-unit-key'), text: e.textContent}))
             .filter(b => !seen.includes(b.key));
         let questionIndex = -1;
         blocks.forEach((b, i) => {
@@ -498,12 +506,12 @@ def _find_reply_key(page, prompt: str, seen: set, previous: str = "") -> tuple[b
 
 
 def _reply_locator(page, key: Optional[str]):
-    return page.locator(f'[data-chatgpt-search-unit-key="{key}"]').filter(has_text=ASSISTANT_LABEL).last
+    return page.locator(_unit_selector(key)).filter(has_text=ASSISTANT_LABEL).last
 
 
 def _reply_turn_locator(page, key: Optional[str]):
     """The whole exchange holding the reply, so images rendered outside the text block are included."""
-    return page.locator(f'[data-turn-key]:has([data-chatgpt-search-unit-key="{key}"])').last
+    return page.locator("[data-turn-key]").filter(has=page.locator(_unit_selector(key))).last
 
 
 def _submit_prompt(page, prompt: str) -> None:
@@ -555,7 +563,7 @@ def _scroll_tab_to_bottom(page) -> None:
     """Scroll the newest message and every scrollable ancestor to the bottom, so the page keeps rendering."""
     try:
         page.evaluate("""() => {
-            const messages = [...document.querySelectorAll('[data-chatgpt-search-unit-key]')]
+            const messages = [...document.querySelectorAll('[data-chatgpt-search-unit-key], [data-content-search-unit-key]')]
                 .filter(e => e.textContent.includes('ChatGPT said:'));
             const last = messages[messages.length - 1];
             if (last) last.scrollIntoView({block: 'end'});
@@ -718,12 +726,22 @@ def _app_page(browser):
         time.sleep(0.5)
 
 
-class AppBackend(TabBackend):
-    """Sends and reads through the ChatGPT desktop app, started by the overlay with its own profile and debug port.
+def _app_process_running() -> bool:
+    """True when a ChatGPT desktop app process is running (with or without the debugging port)."""
+    try:
+        result = subprocess.run(["tasklist", "/FI", "IMAGENAME eq ChatGPT.exe", "/NH"],
+                                capture_output=True, text=True, timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "chatgpt.exe" in result.stdout.lower()
 
-    The app runs in a separate profile under the data directory, so the app you already use is not touched.
-    Sign in once in the window that opens. Reply reading uses the same page selectors as the tab backend,
-    which have not been verified against a desktop chat yet.
+
+class AppBackend(TabBackend):
+    """Sends and reads through the ChatGPT desktop app, started by the overlay with its debug port.
+
+    The app uses the same profile as the one started with `--remote-debugging-port=9223`
+    (`ushi-data\\desktop-profile`), so a sign-in there is kept.
     Requires `pip install -e .[web]`.
     """
     name = "app"
@@ -731,7 +749,7 @@ class AppBackend(TabBackend):
 
     def __init__(self, profile_root: Path):
         self.browser = "app"
-        self.profile_dir = (profile_root / "desktop-app").resolve()
+        self.profile_dir = (profile_root / "desktop-profile").resolve()
 
     def _ensure_browser(self) -> None:
         if _cdp_running(APP_CDP_URL):
@@ -739,6 +757,11 @@ class AppBackend(TabBackend):
         exe = _find_app_exe()
         if exe is None:
             raise RuntimeError("The ChatGPT desktop app was not found on this computer.")
+        if _app_process_running():
+            # The app is single-instance: a new launch would only hand off to this window and exit,
+            # so the debugging port would never open. Only a relaunch with the port can be attached to.
+            raise RuntimeError("The ChatGPT app is already open without the overlay's debugging port. "
+                               "Close the ChatGPT app, then press 1 again so the overlay can start it with the port.")
         _clear_browser_cache(self.profile_dir)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         subprocess.Popen([exe, f"--remote-debugging-port={APP_DEBUG_PORT}", f"--user-data-dir={self.profile_dir}"])

@@ -450,7 +450,6 @@ class Overlay:
 
     def run(self):
         self.root.after(200, self.root.focus_force)
-        self.root.after(1500, self._start)
         self.root.mainloop()
 
 

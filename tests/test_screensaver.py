@@ -3,6 +3,7 @@ import pytest
 from PIL import Image
 
 from ushi.screensaver.background import MAX_FRAMES, PLAYBACK_FPS, BackgroundLoop, Trajectory, trace
+from ushi.screensaver import backends
 from ushi.screensaver.backends import _clear_browser_cache, _find_reply_key, _reply_text, extract_text
 from ushi.screensaver.engine import ArrowPath, IdleTracker, interval_seconds
 from ushi.screensaver.questions import BASES, QUESTION_COUNT, TARGETS, engine_question
@@ -145,3 +146,14 @@ def test_consecutive_background_frames_change_only_slightly():
     second = np.asarray(trace(trajectory.scene()), dtype=float)
     assert first.shape == second.shape == (108, 192, 3)
     assert 0 < np.abs(first - second).mean() < 8
+
+
+def test_app_does_not_relaunch_when_app_is_open_without_port(monkeypatch, tmp_path):
+    launched = []
+    monkeypatch.setattr(backends, "_cdp_running", lambda url=None: False)
+    monkeypatch.setattr(backends, "_find_app_exe", lambda: "ChatGPT.exe")
+    monkeypatch.setattr(backends, "_app_process_running", lambda: True)
+    monkeypatch.setattr(backends.subprocess, "Popen", lambda *a, **k: launched.append(a))
+    with pytest.raises(RuntimeError, match="already open without"):
+        backends.AppBackend(tmp_path)._ensure_browser()
+    assert launched == []
